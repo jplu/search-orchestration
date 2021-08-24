@@ -2,10 +2,23 @@ import json
 import multiprocessing
 import os
 
+from prometheus_client import start_http_server, multiprocess, CollectorRegistry
+
+
+def when_ready(server):
+    registry = CollectorRegistry()
+    multiprocess.MultiProcessCollector(registry)
+    start_http_server(9000, registry=registry)
+
+
+def child_exit(server, worker):
+    multiprocess.mark_process_dead(worker.pid)
+
+
 workers_per_core_str = os.getenv("WORKERS_PER_CORE", "1")
 web_concurrency_str = os.getenv("WEB_CONCURRENCY", None)
 host = os.getenv("HOST", "0.0.0.0")
-port = os.getenv("PORT", "8080")
+port = os.getenv("PORT", "80")
 bind_env = os.getenv("BIND", None)
 use_loglevel = os.getenv("LOG_LEVEL", "info")
 if bind_env:

@@ -9,8 +9,10 @@ import numpy as np
 import tritonclient.grpc as grpcclient
 
 from elasticsearch import Elasticsearch
-from fastapi import FastAPI
+from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.logger import logger as fastapi_logger
+from jose import JWTError, jwt
 from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import BaseModel, HttpUrl
 from starlette.responses import Response, JSONResponse
@@ -21,16 +23,17 @@ import faiss_pb2_grpc
 import faiss_pb2
 
 
-class QueryItem(BaseModel):
-    query: str
-
-
 class DocumentItem(BaseModel):
     url: HttpUrl
     context: str
     pid: int
     title: str
     id: int
+
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
 
 
 class OrchestrationException(Exception):
@@ -45,6 +48,7 @@ es_password = os.getenv("ES_PASSWORD")
 es_host = os.getenv("ES_HOST")
 grpc_faiss_host = os.getenv("FAISS_GRPC_HOST")
 grpc_triton_host = os.getenv("TRITON_GRPC_HOST")
+secret_key = os.getenv("DEVISE_JWT_SECRET_KEY")
 
 es_client = Elasticsearch(
     [es_host],
@@ -75,6 +79,8 @@ try:
 except Exception as e:
     print("Triton channel creation failed: " + str(e))
     sys.exit()
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
 app = FastAPI()
 
@@ -155,11 +161,21 @@ async def orchestration_exception_handler(request, exc):
     )
 
 @app.post('/search', response_model=List[DocumentItem])
-async def search(query: QueryItem, k: int = 5):
-    q = query.query
+async def search(token: str = Depends(oauth2_scheme), k: int = 5):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, secret_key, algorithms=["HS256"])
+    except JWTError:
+        raise credentials_exception
+
+    query = payload.get("query")
     
     try:
-        encoded_query = encode_with_triton(q)
+        encoded_query = encode_with_triton(query)
     except Exception as e:
         raise OrchestrationException(query=query, message=str(e), from_svc="Triton")
     
@@ -172,7 +188,7 @@ async def search(query: QueryItem, k: int = 5):
         documents = get_es_documents(nearest_document_ids)
     except Exception as e:
         raise OrchestrationException(query=query, message=str(e), from_svc="Elasticsearch")
-
+    
     return documents
 
 
