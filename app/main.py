@@ -17,7 +17,7 @@ from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import BaseModel, HttpUrl
 from starlette.responses import Response, JSONResponse
 from starlette.status import HTTP_200_OK
-from transformers import DistilBertTokenizer
+from transformers import AutoTokenizer
 
 import faiss_pb2_grpc
 import faiss_pb2
@@ -61,7 +61,8 @@ es_client = Elasticsearch(
     maxsize=25,
 )
 
-tokenizer = DistilBertTokenizer.from_pretrained('sentence-transformers/msmarco-distilbert-base-v3', use_fast=True)
+encoder_tokenizer = AutoTokenizer.from_pretrained('sentence-transformers/msmarco-distilbert-base-v3')
+rerank_tokenizer = AutoTokenizer.from_pretrained("cross-encoder/ms-marco-MiniLM-L-12-v2")
 
 try:
     faiss_channel = grpc.insecure_channel(f'{grpc_faiss_host}:8081')
@@ -70,7 +71,8 @@ except Exception as e:
     print("FAISS channel creation failed: " + str(e))
     sys.exit()
 
-model_name = "encode_onnx"
+encoder_model_name = "encode_onnx"
+rerank_model_name = "rerank_onnx"
 
 try:
   triton_client = grpcclient.InferenceServerClient(
@@ -97,26 +99,53 @@ fastapi_logger.setLevel(gunicorn_logger.level)
 def encode_with_triton(query):
     inputs = []
     outputs = []
-    model_input = tokenizer.encode_plus(query, truncation=True)
-    input_ids = np.expand_dims(model_input["input_ids"], axis=0)
-    attention_mask = np.expand_dims(model_input["attention_mask"], axis=0)
-    
-    inputs.append(grpcclient.InferInput('input_ids', [1, len(model_input["input_ids"])], "INT64"))
-    inputs.append(grpcclient.InferInput('attention_mask', [1, len(model_input["attention_mask"])], "INT64"))
+    model_input = encoder_tokenizer(query, return_tensors="np", padding=True, truncation=True)
+    input_shape = model_input["input_ids"].shape
 
-    inputs[0].set_data_from_numpy(input_ids)
-    inputs[1].set_data_from_numpy(attention_mask)
+    inputs.append(grpcclient.InferInput('input_ids', input_shape, "INT64"))
+    inputs.append(grpcclient.InferInput('attention_mask', input_shape, "INT64"))
+
+    inputs[0].set_data_from_numpy(model_input["input_ids"])
+    inputs[1].set_data_from_numpy(model_input["attention_mask"])
 
     outputs.append(grpcclient.InferRequestedOutput('sentence_embedding'))
 
     results = triton_client.infer(
-        model_name=model_name,
+        model_name=encoder_model_name,
         inputs=inputs,
         outputs=outputs,
         headers={'test': '1'}
     )
 
     return results.as_numpy('sentence_embedding')[0]
+
+
+def rerank_with_triton(query, documents):
+    queries = [query] * len(documents)
+    paragraphs = [doc["context"] for doc in documents]
+    inputs = []
+    outputs = []
+    model_input = rerank_tokenizer(queries, paragraphs, return_tensors="np", return_token_type_ids=True, padding=True, truncation=True)
+    input_shape = model_input["input_ids"].shape
+
+    inputs.append(grpcclient.InferInput('input_ids', input_shape, "INT64"))
+    inputs.append(grpcclient.InferInput('attention_mask', input_shape, "INT64"))
+    inputs.append(grpcclient.InferInput('token_type_ids', input_shape, "INT64"))
+
+    inputs[0].set_data_from_numpy(model_input["input_ids"])
+    inputs[1].set_data_from_numpy(model_input["attention_mask"])
+    inputs[2].set_data_from_numpy(model_input["token_type_ids"])
+
+    outputs.append(grpcclient.InferRequestedOutput('logits'))
+
+    results = triton_client.infer(
+        model_name=rerank_model_name,
+        inputs=inputs,
+        outputs=outputs,
+        headers={'test': '1'}
+    )
+
+    return results.as_numpy('logits')
 
 
 def nearest_documents_faiss(encoded_query, k):
@@ -160,6 +189,46 @@ async def orchestration_exception_handler(request, exc):
         content={"detail": "Internal server error"},
     )
 
+
+@app.post('/search-with-rerank', response_model=List[DocumentItem])
+async def search(token: str = Depends(oauth2_scheme), k: int = 5):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, secret_key, algorithms=["HS256"])
+    except JWTError:
+        raise credentials_exception
+
+    query = payload.get("query")
+
+    try:
+        encoded_query = encode_with_triton(query)
+    except Exception as e:
+        raise OrchestrationException(query=query, message=str(e), from_svc="Triton Encoder")
+
+    try:
+        nearest_document_ids = nearest_documents_faiss(encoded_query, k * 10)
+    except Exception as e:
+        raise OrchestrationException(query=query, message=str(e), from_svc="FAISS")
+
+    try:
+        documents = get_es_documents(nearest_document_ids)
+    except Exception as e:
+        raise OrchestrationException(query=query, message=str(e), from_svc="Elasticsearch")
+
+    try:
+        rerank_scores = rerank_with_triton(query, documents)
+        reranked_documents = [x for _, x in sorted(zip(rerank_scores, documents), key=lambda pair: pair[0], reverse=True)]
+
+    except Exception as e:
+        raise OrchestrationException(query=query, message=str(e), from_svc="Triton Rerank")
+
+    return reranked_documents[:k]
+
+
 @app.post('/search', response_model=List[DocumentItem])
 async def search(token: str = Depends(oauth2_scheme), k: int = 5):
     credentials_exception = HTTPException(
@@ -177,7 +246,7 @@ async def search(token: str = Depends(oauth2_scheme), k: int = 5):
     try:
         encoded_query = encode_with_triton(query)
     except Exception as e:
-        raise OrchestrationException(query=query, message=str(e), from_svc="Triton")
+        raise OrchestrationException(query=query, message=str(e), from_svc="Triton Encoder")
     
     try:
         nearest_document_ids = nearest_documents_faiss(encoded_query, k)
