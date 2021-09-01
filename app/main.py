@@ -191,12 +191,13 @@ async def orchestration_exception_handler(request, exc):
 
 
 @app.post('/search-with-rerank', response_model=List[DocumentItem])
-async def search(token: str = Depends(oauth2_scheme), k: int = 5):
+async def search(token: str = Depends(oauth2_scheme), k: int = 5, c: int = 0):
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",
         headers={"WWW-Authenticate": "Bearer"},
     )
+    
     try:
         payload = jwt.decode(token, secret_key, algorithms=["HS256"])
     except JWTError:
@@ -204,13 +205,16 @@ async def search(token: str = Depends(oauth2_scheme), k: int = 5):
 
     query = payload.get("query")
 
+    if c <= k:
+        c = k
+
     try:
         encoded_query = encode_with_triton(query)
     except Exception as e:
         raise OrchestrationException(query=query, message=str(e), from_svc="Triton Encoder")
 
     try:
-        nearest_document_ids = nearest_documents_faiss(encoded_query, k * 10)
+        nearest_document_ids = nearest_documents_faiss(encoded_query, c)
     except Exception as e:
         raise OrchestrationException(query=query, message=str(e), from_svc="FAISS")
 
