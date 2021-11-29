@@ -26,4 +26,4 @@ Replace:
 * `<folder_containing_the_model_repository>` by the local folder where the `model_repository` that contains the models is.
 * `<JWT_SECRET>` by the JWT you are using to encrypt the JSON payloads.
 
-Last thing, be sure to have the data loaded in your local Elasticsearch instance.
+Last thing, be sure to have the data loaded in your local Elasticsearch instance as detailed in the [indexing section](https://github.com/jplu/semantic-search/tree/main/scripts#import-the-textual-content-into-elasticsearch).
